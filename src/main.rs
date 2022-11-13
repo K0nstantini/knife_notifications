@@ -1,18 +1,15 @@
-mod rest_api;
-
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::Result;
-use binance::futures::websockets::{FuturesMarket, FuturesWebsocketEvent, FuturesWebSockets};
-use dotenv::dotenv;
-use ftx::options::Options;
-use ftx::ws::{Channel, Data, Ws};
-use futures::StreamExt;
+use anyhow::{bail, Result};
+use binance::websockets::WebSockets;
+use binance::ws_model::{CombinedStreamEvent, WebsocketEvent, WebsocketEventUntag};
 
-const TIME_CHANGE: u64 = 60_000;
-const PRICE_CHANGE: f64 = 0.05;
+mod rest_api;
+
+const TIME_CHANGE: u64 = 5_000;
+const PRICE_CHANGE: f64 = 0.02;
 
 #[derive(Copy, Clone, Debug)]
 struct Prices {
@@ -22,78 +19,63 @@ struct Prices {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
-    let mut ws = Ws::connect(Options::default()).await?;
-
-    let futures = rest_api::get_futures().await?;
-    let channels: Vec<_> = futures.iter().map(|f| Channel::Trades(f.name.to_owned())).collect();
-    ws.subscribe(channels).await?;
-
-    loop {
-        let data = ws.next().await.expect("No data received")?;
-
-        match data {
-            (Some(s), Data::Trade(trade)) => {
-                println!(
-                    "\n{:?} {} {} at {} - liquidation = {}",
-                    trade.side, trade.size, s, trade.price, trade.liquidation
-                );
-            }
-            _ => panic!("Unexpected data type"),
-        }
-    }
-
-    // =========================================================================
+    let markets = rest_api::get_markets().await?;
+    println!("Got {} markets", markets.len());
+    trades_websocket(markets).await?;
+    Ok(())
+}
 
 
-    let endpoints: Vec<_> = vec!["!markPrice@arr@1s"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-
+async fn trades_websocket(markets: Vec<String>) -> Result<()> {
     let mut prices: HashMap<String, Vec<Prices>> = HashMap::new();
 
+    let endpoints = markets.iter().map(|s| format!("{}@trade", s.to_lowercase())).collect();
     let keep_running = AtomicBool::new(true);
-    let mut web_socket = FuturesWebSockets::new(|event: FuturesWebsocketEvent| {
-        match event {
-            FuturesWebsocketEvent::MarkPriceAll(prices_event) => {
-                for e in prices_event {
-                    let price = f64::from_str(e.mark_price.as_str()).unwrap();
-                    let value = Prices { price, time: e.event_time };
-                    prices.entry(e.symbol.clone())
+    let mut web_socket: WebSockets<'_, CombinedStreamEvent<_>> =
+        WebSockets::new(|event: CombinedStreamEvent<WebsocketEventUntag>| {
+            if let WebsocketEventUntag::WebsocketEvent(we) = &event.data {
+                if let WebsocketEvent::Trade(trade) = we {
+                    let price = f64::from_str(&trade.price).unwrap();
+                    let value = Prices { price, time: trade.event_time };
+                    prices
+                        .entry(trade.symbol.clone())
                         .and_modify(|p| {
-                            p.retain(|v| v.time > e.event_time - TIME_CHANGE);
                             p.push(value);
-                            check_change(&p, &e.symbol);
-                        }).or_insert(vec![value]);
+                            price_processing(p, value.price, value.time, &trade.symbol);
+                        })
+                        .or_insert(vec![value]);
                 }
-                // println!("Count coins: {}", prices.iter().count());
             }
+            Ok(())
+        });
+
+    web_socket.connect_multiple(endpoints).await?;
+    web_socket.event_loop(&keep_running).await?;
+    web_socket.disconnect().await?;
+    bail!("Trades disconnected");
+}
+
+
+fn price_processing(prices: &mut Vec<Prices>, last_price: f64, last_time: u64, symbol: &str) {
+    let mut num = 0;
+    let (mut min_price, mut max_price) = (last_price, last_price);
+    for (n, Prices { time, price }) in prices.iter().rev().enumerate() {
+        if *time < last_time - TIME_CHANGE {
+            num = prices.len() - n;
+            break;
+        }
+        match *price {
+            p if p < min_price => min_price = p,
+            p if p > max_price => max_price = p,
             _ => ()
         }
-
-        Ok(())
-    });
-
-    loop {
-        web_socket.connect_multiple_streams(FuturesMarket::USDM, &endpoints).unwrap();
-        if let Err(e) = web_socket.event_loop(&keep_running) {
-            println!("Error: {:?}", e);
-        }
     }
-}
-
-fn check_change(prices: &Vec<Prices>, symbol: &str) {
-    let min_price = prices
-        .iter()
-        .min_by(|x, y| x.price.partial_cmp(&y.price).unwrap())
-        .unwrap().price;
-    let max_price = prices
-        .iter()
-        .max_by(|x, y| x.price.partial_cmp(&y.price).unwrap())
-        .unwrap().price;
     let diff = (1.0 - min_price / max_price).abs();
     if diff > PRICE_CHANGE {
-        println!("{} - {:.2}%", symbol, diff * 100.0);
+        println!("{} - {:.2}%. Last price: {}", symbol, diff * 100.0, last_price);
+        prices.clear();
+    } else {
+        prices.drain(..num);
     }
 }
+
